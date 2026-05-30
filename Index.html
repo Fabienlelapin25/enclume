@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Enclume – Calculateur d'armes Destiny 2 (PvE)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        body { background: #0f172a; color: #e2e8f0; }
+        select { appearance: none; background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%23eab308' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e"); background-position: right 0.5rem center; background-repeat: no-repeat; background-size: 1.5em 1.5em; }
+        canvas { max-height: 200px; }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col items-center p-4">
+    <header class="text-center mb-6">
+        <h1 class="text-4xl font-bold text-yellow-400">⚒️ Enclume</h1>
+        <p class="text-gray-300">Calculateur PvE complet – Stats, Perks, Dégâts, Comparateur</p>
+    </header>
+
+    <!-- Zone de logs -->
+    <div id="error-log" class="w-full max-w-6xl hidden mb-4"></div>
+
+    <!-- Barre de recherche -->
+    <div class="w-full max-w-6xl mb-4">
+        <input type="text" id="search-input" placeholder="Chercher une arme par nom..."
+               class="w-full px-4 py-3 bg-slate-800 border border-slate-600 rounded text-white text-lg" disabled>
+        <div id="search-results" class="mt-2 max-h-52 overflow-y-auto bg-slate-800 rounded"></div>
+    </div>
+
+    <!-- Conteneur principal -->
+    <div id="main-container" class="w-full max-w-6xl flex flex-col lg:flex-row gap-6 hidden">
+        <div id="weapon-panel-1" class="flex-1 bg-slate-800 rounded-lg p-5"></div>
+        <div id="weapon-panel-2" class="flex-1 bg-slate-800 rounded-lg p-5 hidden"></div>
+    </div>
+
+    <div id="status" class="text-sm text-gray-400 mt-4"></div>
+
+    <script>
+        // ==================== CONFIG ====================
+        const API_KEY = '5c28a4b491a74ec3bebab232a8aca388';
+        
+        // Hash des sockets de perks (officiels)
+        const PERK_SOCKET_CATEGORIES = {
+            4241085061: 'Barillet',
+            2423581765: 'Chargeur',
+            218592586: 'Perk 1',
+            331320857: 'Perk 2',
+            2937902448: 'Masterwork',
+            337524679: 'Mod'
+        };
+
+        const STAT_DEFS = {
+            1480404414: { name: 'Impact', category: 'offense' },
+            1591432999: { name: 'Portée', category: 'primary' },
+            4188031367: { name: 'Rechargement', category: 'primary' },
+            943549884: { name: 'Maniement', category: 'primary' },
+            1345609583: { name: 'Stabilité', category: 'primary' },
+            3555269338: { name: 'Cadence', category: 'primary' },
+            3871231066: { name: 'Multiplicateur critique', category: 'hidden' }
+        };
+
+        const STAT_ORDER = ['Impact','Portée','Stabilité','Maniement','Rechargement'];
+
+        // Données de dégâts PvE (basées sur la communauté, ajustables)
+        const ARCHETYPE_DAMAGE = {
+            // Hand Cannons
+            140: { body: 70, crit: 100, rpm: 140 },
+            120: { body: 80, crit: 120, rpm: 120 },
+            180: { body: 60, crit: 90, rpm: 180 },
+            // Auto Rifles
+            600: { body: 20, crit: 30, rpm: 600 },
+            720: { body: 18, crit: 28, rpm: 720 },
+            450: { body: 24, crit: 36, rpm: 450 },
+            // Pulse Rifles
+            340: { body: 32, crit: 48, rpm: 340 },
+            390: { body: 28, crit: 42, rpm: 390 },
+            540: { body: 22, crit: 34, rpm: 540 },
+            // Scout Rifles
+            150: { body: 55, crit: 82, rpm: 150 },
+            180: { body: 48, crit: 72, rpm: 180 },
+            200: { body: 45, crit: 68, rpm: 200 },
+            // SMG
+            600: { body: 16, crit: 24, rpm: 600 },
+            750: { body: 14, crit: 21, rpm: 750 },
+            900: { body: 12, crit: 18, rpm: 900 },
+            // Sidearms
+            300: { body: 45, crit: 60, rpm: 300 },
+            360: { body: 40, crit: 54, rpm: 360 }
+            // Ajoute d'autres archétypes au besoin
+        };
+
+        const ENEMY_MODIFIERS = {
+            minor: 1.0,
+            major: 0.9,
+            boss: 0.8,
+            champion: 0.7
+        };
+
+        let manifest = null;
+        let weapons = [];
+        let selectedWeapon1 = null;
+        let selectedWeapon2 = null;
+
+        // ==================== UTILITAIRES API ====================
+        function logError(msg, details) {
+            const div = document.getElementById('error-log');
+            div.classList.remove('hidden');
+            div.innerHTML = `<div class="bg-red-900/50 border border-red-700 p-3 rounded text-red-200 text-sm">
+                <strong>⚠️ ${msg}</strong>
+                ${details ? '<pre class="mt-1 text-xs whitespace-pre-wrap">'+JSON.stringify(details,null,2)+'</pre>' : ''}
+            </div>`;
+        }
+
+        async function apiCall(url) {
+            const res = await fetch(url, { headers: { 'X-API-Key': API_KEY } });
+            if (!res.ok) {
+                const body = await res.json().catch(() => res.text());
+                logError(`Erreur ${res.status}`, body);
+                throw new Error(`HTTP ${res.status}`);
+            }
+            const data = await res.json();
+            if (data.ErrorCode !== 1) {
+                logError(`Bungie Error ${data.ErrorCode}`, data);
+                throw new Error(data.Message);
+            }
+            return data.Response;
+        }
+
+        // ==================== CHARGEMENT DU MANIFEST ====================
+        async function loadManifest() {
+            const status = document.getElementById('status');
+            status.textContent = '⏳ Connexion à Bungie...';
+            
+            const manifestMeta = await apiCall('https://www.bungie.net/Platform/Destiny2/Manifest/');
+            const zipUrl = 'https://www.bungie.net' + manifestMeta.mobileWorldContentPaths['en'];
+            
+            status.textContent = '⏳ Téléchargement du manifest (20-30 Mo)...';
+            const zipRes = await fetch(zipUrl, { headers: { 'X-API-Key': API_KEY } });
+            if (!zipRes.ok) throw new Error('Échec téléchargement manifest');
+            const blob = await zipRes.blob();
+            
+            status.textContent = '⏳ Décompression...';
+            const zip = await JSZip.loadAsync(blob);
+            const file = Object.values(zip.files).find(f => !f.dir && f.name.endsWith('.json'));
+            if (!file) throw new Error('Fichier JSON introuvable dans le zip');
+            
+            const json = JSON.parse(await file.async('text'));
+            manifest = json;
+            
+            // Extraire les armes
+            weapons = Object.values(json.DestinyInventoryItemDefinition)
+                .filter(i => i.itemType === 3 && i.displayProperties?.name?.length > 0 && i.sockets)
+                .sort((a,b) => a.displayProperties.name.localeCompare(b.displayProperties.name));
+            
+            status.textContent = `✅ ${weapons.length} armes chargées. Prêt.`;
+            document.getElementById('search-input').disabled = false;
+        }
+
+        // ==================== RECHERCHE ====================
+        document.getElementById('search-input').addEventListener('input', e => {
+            const q = e.target.value.toLowerCase().trim();
+            const results = q.length >= 2 ? weapons.filter(w => w.displayProperties.name.toLowerCase().includes(q)).slice(0,12) : [];
+            const container = document.getElementById('search-results');
+            container.innerHTML = results.map(w => `
+                <div class="p-3 hover:bg-slate-600 cursor-pointer flex items-center gap-3 border-b border-slate-700"
+                     onclick="selectWeapon(${w.hash}, 1)">
+                    <img src="https://www.bungie.net${w.displayProperties.icon}" class="w-10 h-10 object-contain">
+                    <div>
+                        <div class="font-medium">${w.displayProperties.name}</div>
+                        <div class="text-xs text-gray-400">${w.itemTypeAndTierDisplayName || ''}</div>
+                    </div>
+                </div>`).join('');
+        });
+
+        // Double-clic pour comparateur
+        document.getElementById('search-input').addEventListener('dblclick', () => {
+            document.getElementById('weapon-panel-2').classList.toggle('hidden');
+            if (!document.getElementById('weapon-panel-2').classList.contains('hidden')) {
+                alert('Comparateur activé : sélectionne une deuxième arme en cliquant dessus avec le bouton droit dans les résultats.');
+            }
+        });
+
+        // Clic droit pour sélectionner arme 2
+        document.addEventListener('contextmenu', e => {
+            const target = e.target.closest('[onclick]');
+            if (target && target.onclick.toString().includes('selectWeapon')) {
+                e.preventDefault();
+                const match = target.onclick.toString().match(/selectWeapon\((\d+)/);
+                if (match) selectWeapon(parseInt(match[1]), 2);
+            }
+        });
+
+        function selectWeapon(hash, panel) {
+            const weapon = manifest.DestinyInventoryItemDefinition[hash];
+            if (!weapon) return;
+            if (panel === 1) selectedWeapon1 = weapon;
+            else selectedWeapon2 = weapon;
+            renderAll();
+        }
+
+        function renderAll() {
+            document.getElementById('main-container').classList.remove('hidden');
+            renderPanel('weapon-panel-1', selectedWeapon1, 1);
+            renderPanel('weapon-panel-2', selectedWeapon2, 2);
+        }
+
+        // ==================== RENDU PANNEAU ====================
+        function renderPanel(containerId, weapon, panelNum) {
+            const container = document.getElementById(containerId);
+            if (!weapon) {
+                container.innerHTML = '<p class="text-gray-400 text-center p-8">Aucune arme sélectionnée</p>';
+                return;
+            }
+
+            // Stats de base
+            const baseStats = {};
+            if (weapon.stats?.stats) {
+                for (const [hash, data] of Object.entries(weapon.stats.stats)) {
+                    if (STAT_DEFS[hash]) baseStats[STAT_DEFS[hash].name] = data.value;
+                }
+            }
+
+            // Sockets de perks
+            const sockets = weapon.sockets?.socketEntries || [];
+            const perkSockets = sockets.filter(s => PERK_SOCKET_CATEGORIES[s.socketTypeHash]);
+
+            // Déterminer l'archétype RPM
+            const rpm = baseStats['Cadence'] || 300;
+            const impact = baseStats['Impact'] || 50;
+
+            container.innerHTML = `
+                <div class="flex items-center gap-4 mb-4">
+                    <img src="https://www.bungie.net${weapon.displayProperties.icon}" class="w-16 h-16 object-contain">
+                    <div>
+                        <h2 class="text-xl font-bold">${weapon.displayProperties.name}</h2>
+                        <p class="text-sm text-gray-400">${weapon.itemTypeAndTierDisplayName || ''} – ${rpm} RPM</p>
+                    </div>
+                </div>
+
+                <!-- Stats visuelles -->
+                <div class="mb-4">
+                    <h3 class="font-semibold mb-2">Statistiques</h3>
+                    <canvas id="stat-chart-${panelNum}" height="130"></canvas>
+                </div>
+
+                <!-- Perks -->
+                <h3 class="font-semibold mb-2">Perks</h3>
+                <div class="space-y-2 mb-4" id="perks-${panelNum}">
+                    ${perkSockets.map(socket => {
+                        const categoryName = PERK_SOCKET_CATEGORIES[socket.socketTypeHash] || 'Emplacement';
+                        const plugs = socket.reusablePlugItems?.map(p => manifest.DestinyInventoryItemDefinition[p.plugItemHash]) || [];
+                        return `
+                        <div>
+                            <label class="text-xs text-gray-400">${categoryName}</label>
+                            <select class="perk-select w-full bg-slate-700 p-2 rounded" data-socket-hash="${socket.socketTypeHash}">
+                                <option value="">-- Aucun --</option>
+                                ${plugs.map(p => `<option value="${p.hash}">${p.displayProperties.name}</option>`).join('')}
+                            </select>
+                        </div>`;
+                    }).join('')}
+                </div>
+
+                <!-- Masterwork -->
+                <h3 class="font-semibold mb-2">Masterwork</h3>
+                <div class="flex gap-4 mb-4">
+                    <select id="mw-stat-${panelNum}" class="flex-1 bg-slate-700 p-2 rounded">
+                        <option value="">Sans masterwork</option>
+                        <option value="Impact">Impact</option>
+                        <option value="Portée">Portée</option>
+                        <option value="Stabilité">Stabilité</option>
+                        <option value="Maniement">Maniement</option>
+                        <option value="Rechargement">Rechargement</option>
+                    </select>
+                    <input type="number" id="mw-tier-${panelNum}" min="0" max="10" value="0" class="w-20 bg-slate-700 p-2 rounded text-center">
+                </div>
+
+                <!-- Mod d'arme -->
+                <h3 class="font-semibold mb-2">Mod d'arme</h3>
+                <select id="weapon-mod-${panelNum}" class="w-full bg-slate-700 p-2 rounded mb-4">
+                    <option value="">Aucun</option>
+                    <option value="icarus">Icarus Grip (+5 Maniement)</option>
+                    <option value="adept-range">Adept Range (+10 Portée)</option>
+                    <option value="backup-mag">Backup Mag (+5 Rechargement)</option>
+                </select>
+
+                <!-- Mods d'armure -->
+                <h3 class="font-semibold mb-2">Mods d'armure</h3>
+                <div class="flex flex-wrap gap-3 mb-4">
+                    <label class="flex items-center gap-1"><input type="checkbox" class="armor-mod" value="surge"> Weapon Surge (x1.10)</label>
+                    <label class="flex items-center gap-1"><input type="checkbox" class="armor-mod" value="cursed"> Maudit (x1.15)</label>
+                    <label class="flex items-center gap-1"><input type="checkbox" class="armor-mod" value="div"> Divinité/Bulle (x1.30)</label>
+                </div>
+
+                <!-- Type d'ennemi -->
+                <h3 class="font-semibold mb-2">Type d'ennemi</h3>
+                <select id="enemy-type-${panelNum}" class="w-full bg-slate-700 p-2 rounded mb-4">
+                    <option value="minor">Mineur (barre rouge)</option>
+                    <option value="major">Major (orange)</option>
+                    <option value="boss">Boss (jaune)</option>
+                    <option value="champion">Champion</option>
+                </select>
+
+                <!-- Delta de puissance -->
+                <h3 class="font-semibold mb-2">Niveau de puissance</h3>
+                <input type="range" id="power-delta-${panelNum}" min="0" max="50" value="0" class="w-full mb-1">
+                <div class="text-sm text-gray-400">Déficit : <span id="power-label-${panelNum}">0</span> niveaux</div>
+
+                <button class="mt-4 w-full bg-yellow-500 text-black font-bold py-2 rounded" onclick="computeAll(${panelNum})">
+                    Calculer les dégâts
+                </button>
+
+                <div id="results-${panelNum}" class="mt-4 hidden bg-slate-700 p-4 rounded">
+                    <h3 class="font-semibold text-yellow-400 mb-2">Résultats</h3>
+                    <div class="grid grid-cols-2 gap-3" id="dmg-display-${panelNum}"></div>
+                </div>
+            `;
+
+            // Événements
+            container.querySelectorAll('select, input[type="checkbox"], input[type="range"], input[type="number"]').forEach(el => {
+                el.addEventListener('change', () => computeAll(panelNum));
+                if (el.type === 'range') el.addEventListener('input', () => {
+                    document.getElementById(`power-label-${panelNum}`).textContent = el.value;
+                    computeAll(panelNum);
+                });
+            });
+
+            // Premier calcul automatique
+            computeAll(panelNum);
+        }
+
+        // ==================== CALCULS ====================
+        function computeAll(panelNum) {
+            const weapon = panelNum === 1 ? selectedWeapon1 : selectedWeapon2;
+            if (!weapon) return;
+
+            // Stats de base
+            const baseStats = {};
+            if (weapon.stats?.stats) {
+                for (const [hash, data] of Object.entries(weapon.stats.stats)) {
+                    if (STAT_DEFS[hash]) baseStats[STAT_DEFS[hash].name] = data.value;
+                }
+            }
+
+            // Appliquer les perks
+            let finalStats = { ...baseStats };
+            const perkSelects = document.querySelectorAll(`#perks-${panelNum} .perk-select`);
+            perkSelects.forEach(select => {
+                const hash = select.value;
+                if (!hash) return;
+                const perk = manifest.DestinyInventoryItemDefinition[hash];
+                if (perk?.statModifiers) {
+                    perk.statModifiers.forEach(mod => {
+                        const name = STAT_DEFS[mod.statHash]?.name;
+                        if (name) finalStats[name] = (finalStats[name] || 0) + mod.value;
+                    });
+                }
+            });
+
+            // Masterwork
+            const mwStat = document.getElementById(`mw-stat-${panelNum}`).value;
+            const mwTier = parseInt(document.getElementById(`mw-tier-${panelNum}`).value) || 0;
+            if (mwStat && mwTier > 0) {
+                finalStats[mwStat] = (finalStats[mwStat] || 0) + mwTier;
+            }
+
+            // Mod d'arme
+            const weaponMod = document.getElementById(`weapon-mod-${panelNum}`).value;
+            if (weaponMod === 'icarus') finalStats['Maniement'] = (finalStats['Maniement'] || 0) + 5;
+            if (weaponMod === 'adept-range') finalStats['Portée'] = (finalStats['Portée'] || 0) + 10;
+            if (weaponMod === 'backup-mag') finalStats['Rechargement'] = (finalStats['Rechargement'] || 0) + 5;
+
+            // Plafonner
+            Object.keys(finalStats).forEach(k => finalStats[k] = Math.min(100, finalStats[k]));
+
+            // Graphique
+            updateStatChart(panelNum, finalStats);
+
+            // Dégâts
+            const impact = finalStats['Impact'] || 50;
+            const rpm = finalStats['Cadence'] || 300;
+            const critMult = finalStats['Multiplicateur critique'] || 1.5;
+            const enemyType = document.getElementById(`enemy-type-${panelNum}`)?.value || 'minor';
+            const powerDelta = parseInt(document.getElementById(`power-delta-${panelNum}`)?.value) || 0;
+            
+            // Trouver l'archétype le plus proche
+            const baseDamage = getBaseDamage(impact, rpm, critMult);
+            
+            // Multiplicateur ennemi
+            const enemyMult = ENEMY_MODIFIERS[enemyType] || 1.0;
+            
+            // Pénalité de puissance (environ 0.7% par niveau sous le niveau recommandé)
+            const powerPenalty = Math.max(0.3, 1 - powerDelta * 0.007);
+            
+            // Mods d'armure
+            let armorMult = 1.0;
+            document.querySelectorAll(`#weapon-panel-${panelNum} .armor-mod:checked`).forEach(cb => {
+                if (cb.value === 'surge') armorMult *= 1.10;
+                if (cb.value === 'cursed') armorMult *= 1.15;
+                if (cb.value === 'div') armorMult *= 1.30;
+            });
+
+            const bodyDamage = Math.round(baseDamage.body * enemyMult * powerPenalty * armorMult);
+            const critDamage = Math.round(baseDamage.crit * enemyMult * powerPenalty * armorMult);
+            const dps = Math.round((critDamage * rpm) / 60);
+            
+            // Rechargement et maniement
+            const reloadStat = finalStats['Rechargement'] || 50;
+            const reloadTime = Math.max(0.8, 3.0 - reloadStat * 0.025); // approx
+            const handlingStat = finalStats['Maniement'] || 50;
+            const handlingTime = Math.max(0.3, 1.2 - handlingStat * 0.01);
+
+            const resultsDiv = document.getElementById(`results-${panelNum}`);
+            resultsDiv.classList.remove('hidden');
+            document.getElementById(`dmg-display-${panelNum}`).innerHTML = `
+                <div class="bg-slate-600 p-2 rounded">Corps : <span class="font-bold">${bodyDamage}</span></div>
+                <div class="bg-slate-600 p-2 rounded">Critique : <span class="font-bold text-yellow-300">${critDamage}</span></div>
+                <div class="bg-slate-600 p-2 rounded">DPS : <span class="font-bold">${dps}</span></div>
+                <div class="bg-slate-600 p-2 rounded">Rechargement : <span class="font-bold">${reloadTime.toFixed(2)}s</span></div>
+                <div class="bg-slate-600 p-2 rounded">Maniement : <span class="font-bold">${handlingTime.toFixed(2)}s</span></div>
+            `;
+        }
+
+        function getBaseDamage(impact, rpm, critMult) {
+            // Table de correspondance impact -> dégâts de base (valeurs communautaires)
+            // Pour simplifier, on utilise une formule par type d'arme basée sur l'impact
+            // Ici une approximation : body = impact * 0.55, crit = body * critMult
+            // Tu peux affiner avec les vrais paliers
+            const body = Math.round(impact * 0.55);
+            const crit = Math.round(body * critMult);
+            return { body, crit };
+        }
+
+        function updateStatChart(panelNum, stats) {
+            const canvas = document.getElementById(`stat-chart-${panelNum}`);
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+            if (canvas.chart) canvas.chart.destroy();
+            canvas.chart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: STAT_ORDER,
+                    datasets: [{
+                        data: STAT_ORDER.map(s => stats[s] || 0),
+                        backgroundColor: statsArray => {
+                            const val = statsArray.raw;
+                            return val >= 80 ? '#4ade80' : val >= 50 ? '#eab308' : '#ef4444';
+                        }
+                    }]
+                },
+                options: {
+                    indexAxis: 'y',
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    scales: {
+                        x: { max: 100, grid: { color: '#334155' } },
+                        y: { grid: { display: false } }
+                    },
+                    plugins: { legend: { display: false } }
+                }
+            });
+        }
+
+        // ==================== DÉMARRAGE ====================
+        loadManifest().catch(e => {
+            document.getElementById('status').textContent = '❌ ' + e.message;
+        });
+    </script>
+</body>
+</html>
